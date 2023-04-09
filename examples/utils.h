@@ -9,7 +9,7 @@
 #include <thread>
 
 //
-// CLI argument parsing
+// GPT CLI argument parsing
 //
 
 struct gpt_params {
@@ -81,3 +81,20 @@ gpt_vocab::id gpt_sample_top_k_top_p(
         double top_p,
         double temp,
         std::mt19937 & rng);
+
+//
+// SAM argument parsing
+//
+
+struct sam_params {
+    int32_t seed      = -1; // RNG seed
+    int32_t n_threads = std::min(4, (int32_t) std::thread::hardware_concurrency());
+
+    std::string model     = "models/sam-vit-b/ggml-model-f16.bin"; // model path
+    std::string fname_inp = "img.jpg";
+    std::string fname_out = "img.out";
+};
+
+bool sam_params_parse(int argc, char ** argv, sam_params & params);
+
+void sam_print_usage(int argc, char ** argv, const sam_params & params);
