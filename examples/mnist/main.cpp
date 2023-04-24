@@ -1,6 +1,7 @@
 #include "ggml/ggml.h"
 
 #include "common.h"
+#include "common-ggml.h"
 
 #include <cassert>
 #include <cmath>
@@ -193,6 +194,8 @@ int mnist_eval(
     //ggml_graph_print   (&gf);
     ggml_graph_dump_dot(&gf, NULL, "mnist.dot");
     float* finalData = ggml_get_data_f32(final);
+
+    ggml_graph_export(&gf, "mnist.ggml");
 
     int prediction = std::max_element(finalData, finalData + 10) - finalData;
     ggml_free(ctx0);
