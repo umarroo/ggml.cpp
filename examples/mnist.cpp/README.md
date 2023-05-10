@@ -10,11 +10,11 @@ The model is given.
 ```bash
 # Build
 git clone git@github.com:umarrudy/ggml.cpp.git
-cd ggml.cpp/example
+cd ggml.cpp/examples/mnist.cpp
 make
 
 # Run the MNIST model
-./main models/mnist/ggml-model-f32.bin models/mnist/t10k-images.idx3-ubyte
+./main
 ```
 
 # Output
