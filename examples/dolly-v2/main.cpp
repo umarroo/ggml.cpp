@@ -7,12 +7,27 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cinttypes>
 #include <fstream>
+#include <iostream>
 #include <map>
 #include <string>
 #include <vector>
-#include <iostream>
+
+#if !defined(_WIN32)
+#define DOLLY_INTERACTIVE_PORT
+#endif
+
+#if defined(DOLLY_INTERACTIVE_PORT)
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
+#endif
+
+#if defined(_MSC_VER)
+#pragma warning(disable: 4244 4267) // possible loss of data
+#endif
 
 // default hparams (Dolly-V2 3B)
 struct dollyv2_hparams {
@@ -22,7 +37,9 @@ struct dollyv2_hparams {
     int32_t n_head  = 32;    // model.config.num_attention_heads
     int32_t n_layer = 32;    // model.config.num_hidden_layers
     int32_t n_rot   = 20;    // rotary_pct[25%] * (n_embd / n_head)
+    int32_t par_res = 1; // 1 = true, 0 = false
     int32_t ftype   = GGML_FTYPE_MOSTLY_F16;
+    float   eps     = 1e-5f;
 };
 
 const std::string INSTRUCTION_KEY = "### Instruction:";
@@ -96,7 +113,7 @@ bool dollyv2_model_load(const std::string & fname, dollyv2_model & model, gpt_vo
     {
         uint32_t magic;
         fin.read((char *) &magic, sizeof(magic));
-        if (magic != 0x67676d6c) {
+        if (magic != GGML_FILE_MAGIC) {
             fprintf(stderr, "%s: invalid model file '%s' (bad magic)\n", __func__, fname.c_str());
             return false;
         }
@@ -112,7 +129,10 @@ bool dollyv2_model_load(const std::string & fname, dollyv2_model & model, gpt_vo
         fin.read((char *) &hparams.n_head,  sizeof(hparams.n_head));
         fin.read((char *) &hparams.n_layer, sizeof(hparams.n_layer));
         fin.read((char *) &hparams.n_rot,   sizeof(hparams.n_rot));
+        fin.read((char *) &hparams.par_res, sizeof(hparams.par_res));
         fin.read((char *) &hparams.ftype,   sizeof(hparams.ftype));
+
+        const int32_t qntvr = hparams.ftype / GGML_QNT_VERSION_FACTOR;
 
         printf("%s: n_vocab = %d\n", __func__, hparams.n_vocab);
         printf("%s: n_ctx   = %d\n", __func__, hparams.n_ctx);
@@ -120,7 +140,11 @@ bool dollyv2_model_load(const std::string & fname, dollyv2_model & model, gpt_vo
         printf("%s: n_head  = %d\n", __func__, hparams.n_head);
         printf("%s: n_layer = %d\n", __func__, hparams.n_layer);
         printf("%s: n_rot   = %d\n", __func__, hparams.n_rot);
+        printf("%s: par_res = %d\n", __func__, hparams.par_res);
         printf("%s: ftype   = %d\n", __func__, hparams.ftype);
+        printf("%s: qntvr   = %d\n", __func__, qntvr);
+
+        hparams.ftype %= GGML_QNT_VERSION_FACTOR;
     }
 
     // load vocab
@@ -128,12 +152,15 @@ bool dollyv2_model_load(const std::string & fname, dollyv2_model & model, gpt_vo
         const int32_t n_vocab = model.hparams.n_vocab;
 
         std::string word;
+        std::vector<char> buf(128);
+
         for (int i = 0; i < n_vocab; i++) {
             uint32_t len;
             fin.read((char *) &len, sizeof(len));
 
-            word.resize(len);
-            fin.read((char *) word.data(), len);
+            buf.resize(len);
+            fin.read((char *) buf.data(), len);
+            word.assign(buf.data(), len);
 
             vocab.token_to_id[word] = i;
             vocab.id_to_token[i] = word;
@@ -194,7 +221,7 @@ bool dollyv2_model_load(const std::string & fname, dollyv2_model & model, gpt_vo
         ctx_size += n_ctx*n_layer*n_embd*ggml_type_sizef(GGML_TYPE_F32); // memory_k
         ctx_size += n_ctx*n_layer*n_embd*ggml_type_sizef(GGML_TYPE_F32); // memory_v
 
-        ctx_size += (6 + 16*n_layer)*256; // object overhead
+        ctx_size += (6 + 16*n_layer)*512; // object overhead
 
         printf("%s: ggml ctx size = %6.2f MB\n", __func__, ctx_size/(1024.0*1024.0));
     }
@@ -202,9 +229,9 @@ bool dollyv2_model_load(const std::string & fname, dollyv2_model & model, gpt_vo
     // create the ggml context
     {
         struct ggml_init_params params = {
-            .mem_size   = ctx_size,
-            .mem_buffer = NULL,
-            .no_alloc   = false,
+            /*.mem_size   =*/ ctx_size,
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ false,
         };
 
         model.ctx = ggml_init(params);
@@ -220,7 +247,6 @@ bool dollyv2_model_load(const std::string & fname, dollyv2_model & model, gpt_vo
 
         const int n_embd  = hparams.n_embd;
         const int n_layer = hparams.n_layer;
-        const int n_ctx   = hparams.n_ctx;
         const int n_vocab = hparams.n_vocab;
 
         model.layers.resize(n_layer);
@@ -303,7 +329,7 @@ bool dollyv2_model_load(const std::string & fname, dollyv2_model & model, gpt_vo
 
         const size_t memory_size = ggml_nbytes(model.memory_k) + ggml_nbytes(model.memory_v);
 
-        printf("%s: memory_size = %8.2f MB, n_mem = %lld\n", __func__, memory_size/1024.0/1024.0, n_mem);
+        printf("%s: memory_size = %8.2f MB, n_mem = %" PRId64 "\n", __func__, memory_size/1024.0/1024.0, n_mem);
     }
 
     // load weights
@@ -336,33 +362,33 @@ bool dollyv2_model_load(const std::string & fname, dollyv2_model & model, gpt_vo
             std::string name(length, 0);
             fin.read(&name[0], length);
 
-            if (model.tensors.find(name.data()) == model.tensors.end()) {
-                fprintf(stderr, "%s: unknown tensor '%s' in model file\n", __func__, name.data());
+            if (model.tensors.find(name) == model.tensors.end()) {
+                fprintf(stderr, "%s: unknown tensor '%s' in model file\n", __func__, name.c_str());
                 return false;
             }
 
-            auto tensor = model.tensors[name.data()];
+            auto tensor = model.tensors[name];
             if (ggml_nelements(tensor) != nelements) {
-                fprintf(stderr, "%s: tensor '%s' has wrong size in model file\n", __func__, name.data());
+                fprintf(stderr, "%s: tensor '%s' has wrong size in model file\n", __func__, name.c_str());
                 return false;
             }
 
             if (tensor->ne[0] != ne[0] || tensor->ne[1] != ne[1]) {
                 fprintf(stderr, "%s: tensor '%s' has wrong shape in model file: got [%5d, %5d], expected [%5d, %5d]\n",
-                        __func__, name.data(), (int) tensor->ne[0], (int) tensor->ne[1], ne[0], ne[1]);
+                        __func__, name.c_str(), (int) tensor->ne[0], (int) tensor->ne[1], ne[0], ne[1]);
                 return false;
             }
 
             // for debugging
             if (0) {
-                printf("%24s - [%5d, %5d], type = %6s, %6.2f MB, %9zu bytes\n", name.data(), ne[0], ne[1], ggml_type_name(ggml_type(ttype)), ggml_nbytes(tensor)/1024.0/1024.0, ggml_nbytes(tensor));
+                printf("%24s - [%5d, %5d], type = %6s, %6.2f MB, %9zu bytes\n", name.c_str(), ne[0], ne[1], ggml_type_name(ggml_type(ttype)), ggml_nbytes(tensor)/1024.0/1024.0, ggml_nbytes(tensor));
             }
 
             const size_t bpe = ggml_type_size(ggml_type(ttype));
 
             if ((nelements*bpe)/ggml_blck_size(tensor->type) != ggml_nbytes(tensor)) {
                 fprintf(stderr, "%s: tensor '%s' has wrong size in model file: got %zu, expected %zu\n",
-                        __func__, name.data(), ggml_nbytes(tensor), nelements*bpe);
+                        __func__, name.c_str(), ggml_nbytes(tensor), nelements*bpe);
                 return false;
             }
 
@@ -383,6 +409,43 @@ bool dollyv2_model_load(const std::string & fname, dollyv2_model & model, gpt_vo
     fin.close();
 
     return true;
+}
+
+// feed-forward network
+ggml_tensor * gpt_neox_ff(
+        const dollyv2_layer & layer,
+        ggml_context        * ctx0,
+        ggml_tensor         * inp,
+        float                 eps) {
+    ggml_tensor * cur = ggml_norm(ctx0, inp, eps);
+
+    cur = ggml_add(ctx0,
+        ggml_mul(ctx0,
+            ggml_repeat(ctx0, layer.ln_2_g, cur),
+            cur),
+        ggml_repeat(ctx0, layer.ln_2_b, cur));
+
+    cur = ggml_mul_mat(ctx0,
+            layer.c_mlp_fc_w,
+            cur);
+
+    cur = ggml_add(ctx0,
+            ggml_repeat(ctx0, layer.c_mlp_fc_b, cur),
+            cur);
+
+    // GELU activation
+    cur = ggml_gelu(ctx0, cur);
+
+    // projection
+    // cur = proj_w*cur + proj_b
+    cur = ggml_mul_mat(ctx0,
+            layer.c_mlp_proj_w,
+            cur);
+
+    cur = ggml_add(ctx0,
+            ggml_repeat(ctx0, layer.c_mlp_proj_b, cur),
+            cur);
+    return cur;
 }
 
 // evaluate the transformer
@@ -428,14 +491,20 @@ bool dollyv2_eval(
     }
 
     struct ggml_init_params params = {
-        .mem_size   = buf_size,
-        .mem_buffer = buf,
-        .no_alloc   = false,
+        /*.mem_size   =*/ buf_size,
+        /*.mem_buffer =*/ buf,
+        /*.no_alloc   =*/ false,
     };
 
     struct ggml_context * ctx0 = ggml_init(params);
-    struct ggml_cgraph gf = { };
-    gf.n_threads = n_threads;
+    struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+
+    // KQ_pos - contains the positions
+    struct ggml_tensor * KQ_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, N);
+    int * data = (int *) KQ_pos->data;
+    for (int i = 0; i < N; ++i) {
+        data[i] = n_past + i;
+    }
 
     struct ggml_tensor * embd = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, N);
     memcpy(embd->data, embd_inp.data(), N*ggml_element_size(embd));
@@ -449,7 +518,7 @@ bool dollyv2_eval(
         // self-attention
         {
             {
-                cur = ggml_norm(ctx0, inpL);
+                cur = ggml_norm(ctx0, inpL, hparams.eps);
 
                 cur = ggml_add(ctx0,
                         ggml_mul(ctx0,
@@ -474,8 +543,8 @@ bool dollyv2_eval(
             struct ggml_tensor * Vcur = ggml_cont(ctx0, ggml_view_3d(ctx0, cur, n_embd/n_head, n_head, N, cur->nb[1]/n_head, cur->nb[1], 2*sizeof(float)*n_embd/n_head));
 
             // using mode = 2 for GPT-NeoX mode
-            Qcur = ggml_rope(ctx0, Qcur, n_past, n_rot, 2);
-            Kcur = ggml_rope(ctx0, Kcur, n_past, n_rot, 2);
+            Qcur = ggml_rope_inplace(ctx0, Qcur, KQ_pos, n_rot, 2, 0);
+            Kcur = ggml_rope_inplace(ctx0, Kcur, KQ_pos, n_rot, 2, 0);
 
             // store key and value to memory
             {
@@ -486,8 +555,8 @@ bool dollyv2_eval(
                         (   n_ctx)*ggml_element_size(model.memory_v),
                         (il*n_ctx)*ggml_element_size(model.memory_v)*n_embd + n_past*ggml_element_size(model.memory_v));
 
-                ggml_build_forward_expand(&gf, ggml_cpy(ctx0, Kcur, k));
-                ggml_build_forward_expand(&gf, ggml_cpy(ctx0, Vcur, v));
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, k));
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, v));
             }
 
             // Q = Qcur.contiguous().view(n_embd/n_head, n_head, N).permute(0, 2, 1, 3)
@@ -509,16 +578,16 @@ bool dollyv2_eval(
 
             // KQ_scaled = KQ / sqrt(n_embd/n_head)
             struct ggml_tensor * KQ_scaled =
-                ggml_scale(ctx0,
+                ggml_scale_inplace(ctx0,
                         KQ,
                         ggml_new_f32(ctx0, 1.0f/sqrt(float(n_embd)/n_head))
                         );
 
             // KQ_masked = mask_past(KQ_scaled)
-            struct ggml_tensor * KQ_masked = ggml_diag_mask_inf(ctx0, KQ_scaled, n_past);
+            struct ggml_tensor * KQ_masked = ggml_diag_mask_inf_inplace(ctx0, KQ_scaled, n_past);
 
             // KQ = soft_max(KQ_masked)
-            struct ggml_tensor * KQ_soft_max = ggml_soft_max(ctx0, KQ_masked);
+            struct ggml_tensor * KQ_soft_max = ggml_soft_max_inplace(ctx0, KQ_masked);
 
             // V_trans = Vmem.view(n_embd/n_head, n_head, n_past + N).permute(1, 2, 0, 3).contiguous()
             struct ggml_tensor * V =
@@ -549,55 +618,32 @@ bool dollyv2_eval(
             }
         }
 
-        struct ggml_tensor * inpFF = cur;
+        if (hparams.par_res == 0) {
+            struct ggml_tensor * inpFF = ggml_add(ctx0, cur, inpL);
 
-        // feed-forward network
-        // this is independent of the self-attention result, so it could be done in parallel to the self-attention
-        {
-            // post attention layer norm
+            cur = gpt_neox_ff(model.layers[il], ctx0, inpFF, hparams.eps);
+
+            // input for next layer
+            inpL = ggml_add(ctx0, cur, inpFF);
+        } else {
+            struct ggml_tensor * inpFF = cur;
+
+            // this is independent of the self-attention result, so it could be done in parallel to the self-attention
             // note here we pass inpL instead of cur
-            {
-                cur = ggml_norm(ctx0, inpL);
+            cur = gpt_neox_ff(model.layers[il], ctx0, inpL, hparams.eps);
 
-                cur = ggml_add(ctx0,
-                    ggml_mul(ctx0,
-                        ggml_repeat(ctx0, model.layers[il].ln_2_g, cur),
-                        cur),
-                    ggml_repeat(ctx0, model.layers[il].ln_2_b, cur));
-            }
+            // layer input + FF
+            cur  = ggml_add(ctx0, cur, inpFF);
 
-            cur = ggml_mul_mat(ctx0,
-                    model.layers[il].c_mlp_fc_w,
-                    cur);
-
-            cur = ggml_add(ctx0,
-                    ggml_repeat(ctx0, model.layers[il].c_mlp_fc_b, cur),
-                    cur);
-
-            // GELU activation
-            cur = ggml_gelu(ctx0, cur);
-
-            // projection
-            // cur = proj_w*cur + proj_b
-            cur = ggml_mul_mat(ctx0,
-                    model.layers[il].c_mlp_proj_w,
-                    cur);
-
-            cur = ggml_add(ctx0,
-                    ggml_repeat(ctx0, model.layers[il].c_mlp_proj_b, cur),
-                    cur);
+            // input for next layer
+            inpL = ggml_add(ctx0, cur, inpL);
         }
 
-        // layer input + FF
-        cur  = ggml_add(ctx0, cur, inpFF);
-
-        // input for next layer
-        inpL = ggml_add(ctx0, cur, inpL);
     }
 
     // norm
     {
-        inpL = ggml_norm(ctx0, inpL);
+        inpL = ggml_norm(ctx0, inpL, hparams.eps);
 
         // inpL = ln_f_g*inpL + ln_f_b
         inpL = ggml_add(ctx0,
@@ -617,11 +663,11 @@ bool dollyv2_eval(
     }
 
     // logits -> probs
-    //inpL = ggml_soft_max(ctx0, inpL);
+    //inpL = ggml_soft_max_inplace(ctx0, inpL);
 
     // run the computation
-    ggml_build_forward_expand(&gf, inpL);
-    ggml_graph_compute       (ctx0, &gf);
+    ggml_build_forward_expand(gf, inpL);
+    ggml_graph_compute_with_ctx(ctx0, gf, n_threads);
 
     //if (n_past%100 == 0) {
     //    ggml_graph_print   (&gf);
@@ -645,7 +691,153 @@ bool dollyv2_eval(
     return true;
 }
 
+std::string execute_prompt(
+        const dollyv2_model &model,
+        gpt_vocab &vocab,
+        const std::string &prompt,
+        gpt_params &params,
+        std::mt19937 &rng,
+        int64_t t_load_us,
+        int64_t t_sample_us,
+        int64_t t_predict_us,
+        size_t mem_per_token,
+        int n_past,
+        bool stream_response_to_cout = false) {
+    std::string output = "";
+    std::vector<float> logits;
+
+    // tokenize the prompt
+    std::vector<gpt_vocab::id> embd_inp = ::gpt_tokenize(vocab, prompt);
+
+    params.n_predict = std::min(params.n_predict, model.hparams.n_ctx - (int)embd_inp.size());
+
+    printf("%s: number of tokens in prompt = %zu\n", __func__, embd_inp.size());
+    for (size_t i = 0; i < embd_inp.size(); i++) {
+        printf("%s: token[%zu] = %6d, %s\n", __func__, i, embd_inp[i], vocab.id_to_token.at(embd_inp[i]).c_str());
+    }
+    printf("\n");
+
+    std::vector<gpt_vocab::id> embd;
+
+    dollyv2_eval(model, params.n_threads, 0, {0, 1, 2, 3}, logits, mem_per_token);
+
+    const int32_t end_token = vocab.token_to_id["### End"];
+
+    for (size_t i = embd.size(); i < embd_inp.size() + params.n_predict; i++) {
+        // predict
+        if (embd.size() > 0) {
+            const int64_t t_start_us = ggml_time_us();
+
+            if (!dollyv2_eval(model, params.n_threads, n_past, embd, logits, mem_per_token)) {
+                printf("Failed to predict\n");
+                return output;
+            }
+
+            t_predict_us += ggml_time_us() - t_start_us;
+        }
+
+        n_past += embd.size();
+        embd.clear();
+
+        if (i >= embd_inp.size()) {
+            // sample next token
+            const int top_k = params.top_k;
+            const float top_p = params.top_p;
+            const float temp = params.temp;
+
+            const int n_vocab = model.hparams.n_vocab;
+
+            gpt_vocab::id id = 0;
+
+            {
+                const int64_t t_start_sample_us = ggml_time_us();
+
+                id = gpt_sample_top_k_top_p(vocab, logits.data() + (logits.size() - n_vocab), top_k, top_p, temp, rng);
+
+                t_sample_us += ggml_time_us() - t_start_sample_us;
+            }
+
+            // add it to the context
+            embd.push_back(id);
+        } else {
+            // if here, it means we are still processing the input prompt
+            for (size_t k = i; k < embd_inp.size(); k++) {
+                embd.push_back(embd_inp[k]);
+                if (int32_t(embd.size()) > params.n_batch) {
+                    break;
+                }
+            }
+            i += embd.size() - 1;
+        }
+
+        // display text
+        for (auto id : embd) {
+            output += vocab.id_to_token[id];
+            if (stream_response_to_cout) {
+                printf("%s", vocab.id_to_token[id].c_str());
+            }
+        }
+        if (stream_response_to_cout) {
+            fflush(stdout);
+        }
+
+        // end of text token
+        if (embd.back() == 0 || (end_token > 0 && embd.back() == end_token)) {
+            return output;
+        }
+    }
+    return output;
+}
+
+#if defined(DOLLY_INTERACTIVE_PORT)
+int setup_port(const int port) {
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        fprintf(stderr, "%s: Failed to create new socket\n", __func__);
+        return -1;
+    }
+
+    sockaddr_in servaddr;
+    std::memset(&servaddr, 0, sizeof(servaddr));
+
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    servaddr.sin_port = htons(port);
+
+    if (bind(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
+        fprintf(stderr, "%s: Failed to bind to port %i\n", __func__, port);
+        return -1;
+    }
+
+    if (listen(sockfd, 10) < 0) {
+        fprintf(stderr, "%s: Failed to listen to socket on port %i\n", __func__, port);
+        return -1;
+    }
+    return sockfd;
+}
+
+std::string read_from_port(int sockfd, int clientfd) {
+    if (clientfd < 0) {
+        fprintf(stderr, "%s: Failed to accept new connection\n", __func__);
+        return "";
+    }
+
+    char buffer[4096];
+    std::memset(buffer, 0, sizeof(buffer));
+
+    if (read(clientfd, buffer, sizeof(buffer)) < 0) {
+        fprintf(stderr, "%s: Failed to read from client\n", __func__);
+    } else {
+        std::cout << "Received: " << buffer;
+        return std::string(buffer);
+    }
+    return std::string("");
+}
+#endif
+
 int main(int argc, char ** argv) {
+    ggml_time_init();
+
     const int64_t t_main_start_us = ggml_time_us();
 
     gpt_params params;
@@ -662,20 +854,15 @@ int main(int argc, char ** argv) {
     printf("%s: seed = %d\n", __func__, params.seed);
 
     std::mt19937 rng(params.seed);
-    if (params.prompt.empty()) {
-        if( !isatty(STDIN_FILENO) ){
-            std::string line;
-            while( std::getline(std::cin, line) ){
-                params.prompt = params.prompt + "\n" + line;
-            }
-        } else {
-            params.prompt = gpt_random_prompt(rng);
-        }
-    }
-
-    const std::string prompt = prompt_for_generation(params.prompt);
 
     int64_t t_load_us = 0;
+    int64_t t_sample_us = 0;
+    int64_t t_predict_us = 0;
+
+    // determine the required inference memory per token:
+    size_t mem_per_token = 0;
+
+    int n_past = 0;
 
     gpt_vocab vocab;
     dollyv2_model model;
@@ -690,92 +877,72 @@ int main(int argc, char ** argv) {
         }
 
         t_load_us = ggml_time_us() - t_start_us;
+
+        test_gpt_tokenizer(vocab, params.token_test);
     }
 
-    int n_past = 0;
-
-    int64_t t_sample_us  = 0;
-    int64_t t_predict_us = 0;
-
-    std::vector<float> logits;
-
-    // tokenize the prompt
-    std::vector<gpt_vocab::id> embd_inp = ::gpt_tokenize(vocab, prompt);
-
-    params.n_predict = std::min(params.n_predict, model.hparams.n_ctx - (int) embd_inp.size());
-
-    printf("%s: number of tokens in prompt = %zu\n", __func__, embd_inp.size());
-    for (int i = 0; i < embd_inp.size(); i++) {
-        printf("%s: token[%d] = %6d, %s\n", __func__, i, embd_inp[i], vocab.id_to_token.at(embd_inp[i]).c_str());
-    }
-    printf("\n");
-
-    std::vector<gpt_vocab::id> embd;
-
-    // determine the required inference memory per token:
-    size_t mem_per_token = 0;
-    dollyv2_eval(model, params.n_threads, 0, { 0, 1, 2, 3 }, logits, mem_per_token);
-
-    const int32_t end_token = vocab.token_to_id["### End"];
-
-    for (int i = embd.size(); i < embd_inp.size() + params.n_predict; i++) {
-        // predict
-        if (embd.size() > 0) {
-            const int64_t t_start_us = ggml_time_us();
-
-            if (!dollyv2_eval(model, params.n_threads, n_past, embd, logits, mem_per_token)) {
-                printf("Failed to predict\n");
-                return 1;
-            }
-
-            t_predict_us += ggml_time_us() - t_start_us;
+#if defined(DOLLY_INTERACTIVE_PORT)
+    int sockfd = -1;
+    if (params.interactive_port != -1) {
+        sockfd = setup_port(params.interactive_port);
+        if (sockfd == -1) {
+            return 1;
         }
-
-        n_past += embd.size();
-        embd.clear();
-
-        if (i >= embd_inp.size()) {
-            // sample next token
-            const int   top_k = params.top_k;
-            const float top_p = params.top_p;
-            const float temp  = params.temp;
-
-            const int n_vocab = model.hparams.n_vocab;
-
-            gpt_vocab::id id = 0;
-
-            {
-                const int64_t t_start_sample_us = ggml_time_us();
-
-                id = gpt_sample_top_k_top_p(vocab, logits.data() + (logits.size() - n_vocab), top_k, top_p, temp, rng);
-
-                t_sample_us += ggml_time_us() - t_start_sample_us;
-            }
-
-            // add it to the context
-            embd.push_back(id);
-
-        } else {
-            // if here, it means we are still processing the input prompt
-            for (int k = i; k < embd_inp.size(); k++) {
-                embd.push_back(embd_inp[k]);
-                if (embd.size() > params.n_batch) {
-                    break;
-                }
-            }
-            i += embd.size() - 1;
-        }
-
-        // display text
-        for (auto id : embd) {
-            printf("%s", vocab.id_to_token[id].c_str());
-        }
+        fprintf(stdout, "Model is ready on port %i\n", params.interactive_port);
         fflush(stdout);
+    }
+#endif
 
-        // end of text token
-        if (embd.back() == 0 || (end_token > 0 && embd.back() == end_token)) {
-            break;
+    if (params.interactive || params.interactive_port != -1) {
+        while (true) {
+            std::string prompt_input;
+#if defined(DOLLY_INTERACTIVE_PORT)
+            int clientfd = -1;
+            if (params.interactive_port != -1) {
+                sockaddr_in clientaddr;
+                socklen_t clientaddrlen = sizeof(clientaddr);
+                clientfd = accept(sockfd, (struct sockaddr *)&clientaddr, &clientaddrlen);
+                prompt_input = read_from_port(sockfd, clientfd);
+            } else
+#endif
+            {
+                printf("Please enter your quesiton:\n>");
+                fflush(stdout);
+
+                std::getline(std::cin, prompt_input);
+            }
+
+            if (strcmp(prompt_input.c_str(), "exit") == 0) {
+                break;
+            }
+
+            const std::string prompt = prompt_for_generation(prompt_input);
+            // call the model
+            const std::string response = execute_prompt(model, vocab, prompt, params, rng, t_load_us, t_sample_us, t_predict_us, mem_per_token, n_past, true);
+
+#if defined(DOLLY_INTERACTIVE_PORT)
+            if (params.interactive_port != -1) {
+                if (write(clientfd, response.c_str(), response.size()) < 0) {
+                    fprintf(stderr, "%s: Failed to write answer '%s' to client\n", __func__, response.c_str());
+                }
+
+                if (close(clientfd) < 0) {
+                    fprintf(stderr, "%s: Failed to close client socket\n", __func__);
+                }
+            } else
+#endif
+            {
+                printf("%s\n\n", response.c_str());
+            }
+            fflush(stdout);
         }
+    } else {
+        if (params.prompt.empty()) {
+            params.prompt = gpt_random_prompt(rng);
+        }
+
+        const std::string prompt = prompt_for_generation(params.prompt);
+        execute_prompt(model, vocab, prompt, params, rng, t_load_us, t_sample_us, t_predict_us, mem_per_token, n_past, true);
     }
 
     // report timing
@@ -784,13 +951,19 @@ int main(int argc, char ** argv) {
 
         printf("\n\n");
         printf("%s: mem per token = %8zu bytes\n", __func__, mem_per_token);
-        printf("%s:     load time = %8.2f ms\n", __func__, t_load_us/1000.0f);
-        printf("%s:   sample time = %8.2f ms\n", __func__, t_sample_us/1000.0f);
-        printf("%s:  predict time = %8.2f ms / %.2f ms per token\n", __func__, t_predict_us/1000.0f, t_predict_us/1000.0f/n_past);
-        printf("%s:    total time = %8.2f ms\n", __func__, (t_main_end_us - t_main_start_us)/1000.0f);
+        printf("%s:     load time = %8.2f ms\n", __func__, t_load_us / 1000.0f);
+        printf("%s:   sample time = %8.2f ms\n", __func__, t_sample_us / 1000.0f);
+        printf("%s:  predict time = %8.2f ms / %.2f ms per token\n", __func__, t_predict_us / 1000.0f, t_predict_us / 1000.0f / n_past);
+        printf("%s:    total time = %8.2f ms\n", __func__, (t_main_end_us - t_main_start_us) / 1000.0f);
     }
 
     ggml_free(model.ctx);
+
+#if defined(DOLLY_INTERACTIVE_PORT)
+    if (params.interactive_port != -1 && close(sockfd) < 0) {
+        fprintf(stderr, "%s: Failed to close server socket\n", __func__);
+    }
+#endif
 
     return 0;
 }
